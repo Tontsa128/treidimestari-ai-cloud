@@ -3,6 +3,10 @@
 import streamlit as st
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import pandas as pd
+import numpy as np
+import requests
+import plotly.graph_objects as go
 
 # =========================
 # ASETUKSET
@@ -24,33 +28,18 @@ def now_fi():
     return datetime.now(HELSINKI_TZ)
 
 # =========================
-# SESSION STATE
-# =========================
-
-def init_state():
-    defaults = {
-        "logged_in": False,
-        "ai_notes": [],
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-init_state()
-
-# =========================
 # LOGIN
 # =========================
 
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
 def login():
     st.title("🔐 TreidiMestari AI Cloud")
-
     password = st.text_input("Salasana", type="password")
 
-    correct = st.secrets.get("APP_PASSWORD", "1234")
-
-    if st.button("Kirjaudu sisään"):
-        if password == correct:
+    if st.button("Kirjaudu"):
+        if password == "1234":
             st.session_state.logged_in = True
             st.rerun()
         else:
@@ -61,14 +50,6 @@ if not st.session_state.logged_in:
     st.stop()
 
 # =========================
-# PÄÄ SOVELLUS
-# =========================
-
-st.title("📈 TreidiMestari AI Cloud")
-
-st.caption(f"Aika: {now_fi().strftime('%H:%M:%S')} (Suomi)")
-
-# =========================
 # SIDEBAR
 # =========================
 
@@ -76,7 +57,13 @@ st.sidebar.title("⚙️ Asetukset")
 
 symbol = st.sidebar.selectbox(
     "Valitse kohde",
-    ["BTC", "ETH", "SOL", "XRP", "DOGE"]
+    {
+        "BTC": "BTCUSDT",
+        "ETH": "ETHUSDT",
+        "SOL": "SOLUSDT",
+        "XRP": "XRPUSDT",
+        "DOGE": "DOGEUSDT"
+    }
 )
 
 tf = st.sidebar.selectbox(
@@ -84,49 +71,73 @@ tf = st.sidebar.selectbox(
     ["1m", "5m", "15m", "1h"]
 )
 
-st.sidebar.divider()
-
-st.sidebar.subheader("🤖 ChatGPT")
-
-api_key = st.sidebar.text_input("API-avain", type="password")
+limit = st.sidebar.slider("Kynttilät", 50, 300, 120)
 
 # =========================
-# DEMO DATA
+# DATA BINANCE
 # =========================
 
-import pandas as pd
-import numpy as np
+def get_data(symbol, interval, limit):
+    url = "https://api.binance.com/api/v3/klines"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }
 
-def demo_data():
-    price = 50000
-    rows = []
+    r = requests.get(url, params=params)
+    data = r.json()
 
-    for i in range(100):
-        o = price
-        price *= 1 + np.random.normal(0, 0.002)
-        c = price
-        h = max(o, c) * 1.002
-        l = min(o, c) * 0.998
+    df = pd.DataFrame(data, columns=[
+        "time","open","high","low","close","volume",
+        "_1","_2","_3","_4","_5","_6"
+    ])
 
-        rows.append([o, h, l, c])
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
+    df["open"] = df["open"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
+    df["close"] = df["close"].astype(float)
+    df["volume"] = df["volume"].astype(float)
 
-    return pd.DataFrame(rows, columns=["Open", "High", "Low", "Close"])
+    return df
 
-df = demo_data()
+df = get_data(symbol, tf, limit)
 
 # =========================
-# YKSINKERTAINEN SIGNALI
+# INDIKAATTORIT
+# =========================
+
+df["EMA9"] = df["close"].ewm(span=9).mean()
+df["EMA21"] = df["close"].ewm(span=21).mean()
+
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+df["RSI"] = rsi(df["close"])
+
+# =========================
+# SIGNALI
 # =========================
 
 last = df.iloc[-1]
-prev = df.iloc[-2]
 
-if last["Close"] > prev["Close"]:
+if last["EMA9"] > last["EMA21"] and last["RSI"] < 70:
     signal = "OSTA"
     color = "green"
-elif last["Close"] < prev["Close"]:
+
+elif last["EMA9"] < last["EMA21"] and last["RSI"] > 30:
     signal = "MYY"
     color = "red"
+
 else:
     signal = "ODOTA"
     color = "orange"
@@ -134,6 +145,9 @@ else:
 # =========================
 # UI
 # =========================
+
+st.title("📈 TreidiMestari AI Cloud")
+st.caption(f"Aika: {now_fi().strftime('%H:%M:%S')}")
 
 st.subheader("📊 Signaali")
 
@@ -143,18 +157,61 @@ st.markdown(
 )
 
 # =========================
-# AI MUISTI
+# KYNNTILÄKAAVIO
 # =========================
 
-if st.button("Tallenna signaali muistiin"):
-    st.session_state.ai_notes.append({
-        "time": now_fi().strftime("%H:%M:%S"),
-        "symbol": symbol,
-        "signal": signal
-    })
+fig = go.Figure()
 
-if st.session_state.ai_notes:
-    st.subheader("🧠 AI Muisti")
+fig.add_trace(go.Candlestick(
+    x=df["time"],
+    open=df["open"],
+    high=df["high"],
+    low=df["low"],
+    close=df["close"],
+    name="Kynttilät"
+))
 
-    for note in st.session_state.ai_notes:
-        st.write(note)
+fig.add_trace(go.Scatter(
+    x=df["time"],
+    y=df["EMA9"],
+    line=dict(color="blue"),
+    name="EMA9"
+))
+
+fig.add_trace(go.Scatter(
+    x=df["time"],
+    y=df["EMA21"],
+    line=dict(color="red"),
+    name="EMA21"
+))
+
+fig.update_layout(
+    template="plotly_dark",
+    height=600
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+# =========================
+# RSI
+# =========================
+
+st.subheader("📉 RSI")
+
+fig2 = go.Figure()
+
+fig2.add_trace(go.Scatter(
+    x=df["time"],
+    y=df["RSI"],
+    name="RSI"
+))
+
+fig2.add_hline(y=70)
+fig2.add_hline(y=30)
+
+fig2.update_layout(
+    template="plotly_dark",
+    height=300
+)
+
+st.plotly_chart(fig2, use_container_width=True)
