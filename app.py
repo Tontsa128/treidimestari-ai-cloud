@@ -7,11 +7,12 @@ import pandas as pd
 import numpy as np
 import requests
 import plotly.graph_objects as go
-from openai import OpenAI
 
-# =========================
-# SIVUN ASETUKSET
-# =========================
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
 
 st.set_page_config(
     page_title="TreidiMestari AI Cloud",
@@ -19,18 +20,11 @@ st.set_page_config(
     layout="wide"
 )
 
-# =========================
-# SUOMEN AIKA
-# =========================
-
 HELSINKI_TZ = ZoneInfo("Europe/Helsinki")
 
 def now_fi():
     return datetime.now(HELSINKI_TZ)
 
-# =========================
-# SESSION STATE
-# =========================
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -38,16 +32,12 @@ if "logged_in" not in st.session_state:
 if "ai_memory" not in st.session_state:
     st.session_state.ai_memory = []
 
-# =========================
-# LOGIN
-# =========================
 
 def login():
     st.title("🔐 TreidiMestari AI Cloud")
     st.write("Kirjaudu sisään jatkaaksesi.")
 
     password = st.text_input("Salasana", type="password")
-
     correct_password = st.secrets.get("APP_PASSWORD", "1234")
 
     if st.button("Kirjaudu"):
@@ -57,74 +47,132 @@ def login():
         else:
             st.error("Väärä salasana")
 
+
 if not st.session_state.logged_in:
     login()
     st.stop()
 
-# =========================
-# SIDEBAR
-# =========================
 
 st.sidebar.title("⚙️ Asetukset")
 
-symbols = {
+SYMBOLS = {
     "BTC / USDT": "BTCUSDT",
     "ETH / USDT": "ETHUSDT",
     "SOL / USDT": "SOLUSDT",
     "XRP / USDT": "XRPUSDT",
     "DOGE / USDT": "DOGEUSDT",
-    "BNB / USDT": "BNBUSDT"
+    "BNB / USDT": "BNBUSDT",
 }
 
-selected_name = st.sidebar.selectbox("Valitse kohde", list(symbols.keys()))
-symbol = symbols[selected_name]
+selected_name = st.sidebar.selectbox("Valitse kohde", list(SYMBOLS.keys()))
+symbol = SYMBOLS[selected_name]
 
 tf = st.sidebar.selectbox("Aikaväli", ["1m", "3m", "5m", "15m", "1h"], index=0)
 limit = st.sidebar.slider("Kynttilöitä", 80, 300, 160)
 
 st.sidebar.divider()
 st.sidebar.subheader("🤖 ChatGPT")
-
 chatgpt_on = st.sidebar.toggle("ChatGPT-analyysi päällä", value=True)
 api_key_input = st.sidebar.text_input("OpenAI API-avain", type="password")
 
-# =========================
-# DATA BINANCE
-# =========================
 
-@st.cache_data(ttl=3, show_spinner=False)
+BINANCE_URLS = [
+    "https://data-api.binance.vision/api/v3/klines",
+    "https://api1.binance.com/api/v3/klines",
+    "https://api2.binance.com/api/v3/klines",
+    "https://api3.binance.com/api/v3/klines",
+    "https://api4.binance.com/api/v3/klines",
+]
+
+
+def make_demo_data(limit_count, base_price=50000):
+    now = pd.Timestamp.now(tz="Europe/Helsinki").floor("min")
+    idx = pd.date_range(end=now, periods=limit_count, freq="min")
+
+    price = float(base_price)
+    rows = []
+
+    for t in idx:
+        o = price
+        price *= 1 + np.random.normal(0, 0.0018)
+        c = price
+        h = max(o, c) * (1 + abs(np.random.normal(0, 0.001)))
+        l = min(o, c) * (1 - abs(np.random.normal(0, 0.001)))
+        v = abs(np.random.normal(100, 25))
+        rows.append([t, o, h, l, c, v])
+
+    return pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
+
+
+@st.cache_data(ttl=4, show_spinner=False)
 def get_data(symbol_code, interval, limit_count):
-    url = "https://api.binance.com/api/v3/klines"
+    last_error = ""
 
-    params = {
-        "symbol": symbol_code,
-        "interval": interval,
-        "limit": limit_count
-    }
+    for url in BINANCE_URLS:
+        try:
+            params = {
+                "symbol": symbol_code,
+                "interval": interval,
+                "limit": int(limit_count)
+            }
 
-    r = requests.get(url, params=params, timeout=10)
+            r = requests.get(
+                url,
+                params=params,
+                timeout=10,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/json"
+                }
+            )
 
-    if r.status_code != 200:
-        raise RuntimeError(f"Binance virhe: {r.status_code}")
+            if r.status_code != 200:
+                last_error = f"{url} status {r.status_code}"
+                continue
 
-    data = r.json()
+            data = r.json()
 
-    df = pd.DataFrame(data, columns=[
-        "time", "open", "high", "low", "close", "volume",
-        "_1", "_2", "_3", "_4", "_5", "_6"
-    ])
+            if not isinstance(data, list) or len(data) < 20:
+                last_error = f"{url} palautti huonon datan"
+                continue
 
-    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-    df["time"] = df["time"].dt.tz_convert("Europe/Helsinki")
+            df = pd.DataFrame(data, columns=[
+                "time", "open", "high", "low", "close", "volume",
+                "_1", "_2", "_3", "_4", "_5", "_6"
+            ])
 
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
+            df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+            df["time"] = df["time"].dt.tz_convert("Europe/Helsinki")
 
-    return df
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# =========================
-# INDIKAATTORIT
-# =========================
+            df = df.dropna()
+
+            if len(df) < 20:
+                last_error = "liian vähän kelvollista dataa"
+                continue
+
+            return df, "Binance live data"
+
+        except Exception as e:
+            last_error = str(e)
+
+    base = 50000
+    if "ETH" in symbol_code:
+        base = 3500
+    elif "SOL" in symbol_code:
+        base = 150
+    elif "XRP" in symbol_code:
+        base = 0.6
+    elif "DOGE" in symbol_code:
+        base = 0.15
+    elif "BNB" in symbol_code:
+        base = 600
+
+    demo = make_demo_data(limit_count, base)
+    return demo, f"Demo-varadata käytössä. Binance ei vastannut: {last_error}"
+
 
 def add_indicators(df):
     df = df.copy()
@@ -138,12 +186,12 @@ def add_indicators(df):
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
+    avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
     df["RSI"] = 100 - (100 / (1 + rs))
-    df["RSI"] = df["RSI"].fillna(50)
+    df["RSI"] = df["RSI"].fillna(50).clip(0, 100)
 
     ema12 = df["close"].ewm(span=12, adjust=False).mean()
     ema26 = df["close"].ewm(span=26, adjust=False).mean()
@@ -152,70 +200,71 @@ def add_indicators(df):
     df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
     df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
 
-    df["VOL_MA"] = df["volume"].rolling(20).mean().fillna(df["volume"])
+    df["VOL_MA"] = df["volume"].rolling(20, min_periods=5).mean().bfill()
 
     tr1 = df["high"] - df["low"]
     tr2 = (df["high"] - df["close"].shift()).abs()
     tr3 = (df["low"] - df["close"].shift()).abs()
 
-    df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
-    df["ATR"] = df["ATR"].fillna(tr1.mean())
+    df["ATR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["ATR"] = df["ATR"].rolling(14, min_periods=5).mean().bfill()
+
+    typical = (df["high"] + df["low"] + df["close"]) / 3
+    volume_sum = df["volume"].replace(0, np.nan).cumsum()
+    df["VWAP"] = (typical * df["volume"]).cumsum() / volume_sum
+    df["VWAP"] = df["VWAP"].ffill().bfill()
 
     return df
 
-# =========================
-# SIGNAALILOGIIKKA
-# =========================
 
 def calculate_signal(df):
     last = df.iloc[-1]
-    prev = df.iloc[-2]
 
     score = 0
     reasons = []
-
-    price = last["close"]
+    price = float(last["close"])
 
     if last["EMA9"] > last["EMA21"]:
         score += 15
         reasons.append("EMA9 on EMA21 yläpuolella.")
-
-    if last["EMA9"] < last["EMA21"]:
+    else:
         score -= 15
         reasons.append("EMA9 on EMA21 alapuolella.")
 
     if price > last["EMA50"]:
         score += 10
         reasons.append("Hinta on EMA50 yläpuolella.")
-
-    if price < last["EMA50"]:
+    else:
         score -= 10
         reasons.append("Hinta on EMA50 alapuolella.")
 
     if last["EMA50"] > last["EMA100"]:
         score += 10
         reasons.append("EMA50 on EMA100 yläpuolella.")
-
-    if last["EMA50"] < last["EMA100"]:
+    else:
         score -= 10
         reasons.append("EMA50 on EMA100 alapuolella.")
+
+    if price > last["VWAP"]:
+        score += 8
+        reasons.append("Hinta on VWAP yläpuolella.")
+    else:
+        score -= 8
+        reasons.append("Hinta on VWAP alapuolella.")
 
     if last["RSI"] < 30:
         score += 12
         reasons.append("RSI on ylimyyty.")
-
     elif last["RSI"] > 70:
         score -= 12
         reasons.append("RSI on yliostettu.")
-
     else:
         reasons.append(f"RSI on neutraali: {last['RSI']:.1f}.")
 
     if last["MACD"] > last["MACD_SIGNAL"]:
         score += 12
         reasons.append("MACD on noususuuntainen.")
-
-    if last["MACD"] < last["MACD_SIGNAL"]:
+    else:
         score -= 12
         reasons.append("MACD on laskusuuntainen.")
 
@@ -228,36 +277,50 @@ def calculate_signal(df):
 
     body = abs(last["close"] - last["open"])
     candle_range = max(last["high"] - last["low"], 0.0000001)
-
     body_ratio = body / candle_range
 
     if last["close"] > last["open"] and body_ratio > 0.55:
         score += 10
         reasons.append("Viimeinen kynttilä on vahva vihreä.")
-
-    if last["close"] < last["open"] and body_ratio > 0.55:
+    elif last["close"] < last["open"] and body_ratio > 0.55:
         score -= 10
         reasons.append("Viimeinen kynttilä on vahva punainen.")
+    else:
+        reasons.append("Viimeinen kynttilä on epävarma.")
 
-    if score >= 45:
+    recent = df.tail(80)
+    support = float(recent["low"].quantile(0.08))
+    resistance = float(recent["high"].quantile(0.92))
+
+    if price > resistance * 0.998:
+        score += 7
+        reasons.append("Hinta on lähellä vastusta / breakout-aluetta.")
+
+    if price < support * 1.002:
+        score -= 7
+        reasons.append("Hinta on lähellä tukea / breakdown-riski.")
+
+    score = int(max(-100, min(100, score)))
+
+    if score >= 55:
         signal = "VAHVA OSTA"
         color = "#22c55e"
-    elif score >= 25:
+    elif score >= 28:
         signal = "OSTA"
         color = "#86efac"
-    elif score <= -45:
+    elif score <= -55:
         signal = "VAHVA MYY"
         color = "#ef4444"
-    elif score <= -25:
+    elif score <= -28:
         signal = "MYY"
         color = "#fca5a5"
     else:
         signal = "ODOTA"
         color = "#facc15"
 
-    confidence = int(min(95, max(45, 50 + abs(score) * 0.7)))
+    confidence = int(min(95, max(45, 50 + abs(score) * 0.45)))
 
-    atr = max(last["ATR"], price * 0.001)
+    atr = max(float(last["ATR"]), price * 0.001)
 
     if "OSTA" in signal:
         stop = price - atr * 1.4
@@ -271,37 +334,36 @@ def calculate_signal(df):
 
     return {
         "signal": signal,
-        "score": int(score),
+        "score": score,
         "confidence": confidence,
         "color": color,
         "price": price,
         "stop": stop,
         "target": target,
+        "support": support,
+        "resistance": resistance,
         "reasons": reasons
     }
 
-# =========================
-# CHATGPT ANALYYSI
-# =========================
 
 def chatgpt_analysis(df, ai):
     if not chatgpt_on:
         return "ChatGPT-analyysi ei ole päällä."
 
+    if OpenAI is None:
+        return "OpenAI-kirjasto ei ole käytössä. Tarkista requirements.txt."
+
     api_key = api_key_input or st.secrets.get("OPENAI_API_KEY", "")
 
     if not api_key:
-        return "Lisää OpenAI API-avain sivupalkkiin tai secrets.toml-tiedostoon."
+        return "Lisää OpenAI API-avain sivupalkkiin tai Streamlit Secrets -kohtaan."
 
     try:
         client = OpenAI(api_key=api_key)
-
         last = df.iloc[-1]
 
         prompt = f"""
 Olet selkeä treidausopettaja. Tämä on opetustyökalu, ei sijoitusneuvo.
-
-Analysoi tilanne suomeksi lyhyesti.
 
 Kohde: {selected_name}
 Aikaväli: {tf}
@@ -316,19 +378,22 @@ EMA9: {last['EMA9']:.6f}
 EMA21: {last['EMA21']:.6f}
 EMA50: {last['EMA50']:.6f}
 EMA100: {last['EMA100']:.6f}
+VWAP: {last['VWAP']:.6f}
+Support: {ai['support']}
+Resistance: {ai['resistance']}
 
-Selitä:
+Selitä lyhyesti:
 1. Mitä kaaviossa tapahtuu nyt
 2. Miksi signaali on tämä
 3. Mitä aloittelijan pitää varoa
-4. Mikä voisi vahvistaa signaalin
-5. Mikä voisi kumota signaalin
-
-Vastaa napakasti ja käytännöllisesti.
+4. Mikä vahvistaa signaalin
+5. Mikä kumoaa signaalin
 """
 
+        model_name = st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")
+
         response = client.responses.create(
-            model="gpt-5.5",
+            model=model_name,
             input=prompt
         )
 
@@ -337,21 +402,18 @@ Vastaa napakasti ja käytännöllisesti.
     except Exception as e:
         return f"ChatGPT virhe: {e}"
 
-# =========================
-# UI
-# =========================
 
 st.title("📈 TreidiMestari AI Cloud")
 st.caption(f"Suomen aika: {now_fi().strftime('%H:%M:%S')}")
 
-try:
-    df = get_data(symbol, tf, limit)
-    df = add_indicators(df)
-    ai = calculate_signal(df)
+df, source_info = get_data(symbol, tf, limit)
+df = add_indicators(df)
+ai = calculate_signal(df)
 
-except Exception as e:
-    st.error(f"Dataa ei saatu: {e}")
-    st.stop()
+if "Demo-varadata" in source_info:
+    st.warning(source_info)
+else:
+    st.success(source_info)
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Kohde", selected_name)
@@ -378,10 +440,6 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# =========================
-# KAAVIO
-# =========================
-
 fig = go.Figure()
 
 fig.add_trace(go.Candlestick(
@@ -393,33 +451,14 @@ fig.add_trace(go.Candlestick(
     name="Kynttilät"
 ))
 
-fig.add_trace(go.Scatter(
-    x=df["time"],
-    y=df["EMA9"],
-    name="EMA9",
-    mode="lines"
-))
+fig.add_trace(go.Scatter(x=df["time"], y=df["EMA9"], name="EMA9", mode="lines"))
+fig.add_trace(go.Scatter(x=df["time"], y=df["EMA21"], name="EMA21", mode="lines"))
+fig.add_trace(go.Scatter(x=df["time"], y=df["EMA50"], name="EMA50", mode="lines"))
+fig.add_trace(go.Scatter(x=df["time"], y=df["EMA100"], name="EMA100", mode="lines"))
+fig.add_trace(go.Scatter(x=df["time"], y=df["VWAP"], name="VWAP", mode="lines"))
 
-fig.add_trace(go.Scatter(
-    x=df["time"],
-    y=df["EMA21"],
-    name="EMA21",
-    mode="lines"
-))
-
-fig.add_trace(go.Scatter(
-    x=df["time"],
-    y=df["EMA50"],
-    name="EMA50",
-    mode="lines"
-))
-
-fig.add_trace(go.Scatter(
-    x=df["time"],
-    y=df["EMA100"],
-    name="EMA100",
-    mode="lines"
-))
+fig.add_hline(y=ai["support"], line_dash="dot")
+fig.add_hline(y=ai["resistance"], line_dash="dot")
 
 if ai["stop"] is not None:
     fig.add_hline(y=ai["stop"], line_dash="dash")
@@ -429,58 +468,31 @@ fig.update_layout(
     title=f"{selected_name} — {tf}",
     template="plotly_dark",
     height=650,
-    xaxis_rangeslider_visible=False
+    xaxis_rangeslider_visible=False,
+    margin=dict(l=10, r=10, t=50, b=10)
 )
 
 st.plotly_chart(fig, use_container_width=True)
-
-# =========================
-# LISÄKAAVIOT
-# =========================
 
 left, right = st.columns(2)
 
 with left:
     st.subheader("📉 RSI")
-
     rsi_fig = go.Figure()
-    rsi_fig.add_trace(go.Scatter(
-        x=df["time"],
-        y=df["RSI"],
-        name="RSI"
-    ))
+    rsi_fig.add_trace(go.Scatter(x=df["time"], y=df["RSI"], name="RSI"))
     rsi_fig.add_hline(y=70, line_dash="dot")
     rsi_fig.add_hline(y=30, line_dash="dot")
     rsi_fig.update_layout(template="plotly_dark", height=300)
-
     st.plotly_chart(rsi_fig, use_container_width=True)
 
 with right:
     st.subheader("📊 MACD")
-
     macd_fig = go.Figure()
-    macd_fig.add_trace(go.Scatter(
-        x=df["time"],
-        y=df["MACD"],
-        name="MACD"
-    ))
-    macd_fig.add_trace(go.Scatter(
-        x=df["time"],
-        y=df["MACD_SIGNAL"],
-        name="Signal"
-    ))
-    macd_fig.add_trace(go.Bar(
-        x=df["time"],
-        y=df["MACD_HIST"],
-        name="Histogram"
-    ))
+    macd_fig.add_trace(go.Scatter(x=df["time"], y=df["MACD"], name="MACD"))
+    macd_fig.add_trace(go.Scatter(x=df["time"], y=df["MACD_SIGNAL"], name="Signal"))
+    macd_fig.add_trace(go.Bar(x=df["time"], y=df["MACD_HIST"], name="Histogram"))
     macd_fig.update_layout(template="plotly_dark", height=300)
-
     st.plotly_chart(macd_fig, use_container_width=True)
-
-# =========================
-# STOP / TARGET
-# =========================
 
 st.subheader("🎯 Entry / Stop / Target")
 
@@ -492,18 +504,10 @@ if ai["stop"] is not None:
 else:
     st.info("Ei vielä selkeää entryä. Odota vahvempaa signaalia.")
 
-# =========================
-# MIKSI SIGNAAALI
-# =========================
-
 st.subheader("🧠 Miksi signaali on tämä?")
 
 for reason in ai["reasons"]:
     st.write("• " + reason)
-
-# =========================
-# CHATGPT
-# =========================
 
 st.subheader("🤖 ChatGPT-treidiopettaja")
 
@@ -520,10 +524,6 @@ if st.button("Analysoi ChatGPT:llä"):
     })
 
     st.write(result)
-
-# =========================
-# AI MUISTI
-# =========================
 
 with st.expander("🧠 AI-muisti"):
     if st.session_state.ai_memory:
