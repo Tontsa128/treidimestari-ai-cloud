@@ -14,6 +14,10 @@ except Exception:
     OpenAI = None
 
 
+# =========================
+# ASETUKSET
+# =========================
+
 st.set_page_config(
     page_title="TreidiMestari AI Cloud",
     page_icon="📈",
@@ -22,16 +26,31 @@ st.set_page_config(
 
 HELSINKI_TZ = ZoneInfo("Europe/Helsinki")
 
+
 def now_fi():
     return datetime.now(HELSINKI_TZ)
 
 
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
+# =========================
+# SESSION STATE
+# =========================
 
-if "ai_memory" not in st.session_state:
-    st.session_state.ai_memory = []
+defaults = {
+    "logged_in": False,
+    "ai_memory": [],
+    "api_key": "",
+    "paper_balance": 10000.0,
+    "paper_trades": [],
+}
 
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+# =========================
+# LOGIN
+# =========================
 
 def login():
     st.title("🔐 TreidiMestari AI Cloud")
@@ -53,6 +72,10 @@ if not st.session_state.logged_in:
     st.stop()
 
 
+# =========================
+# SIDEBAR
+# =========================
+
 st.sidebar.title("⚙️ Asetukset")
 
 SYMBOLS = {
@@ -68,13 +91,42 @@ selected_name = st.sidebar.selectbox("Valitse kohde", list(SYMBOLS.keys()))
 symbol = SYMBOLS[selected_name]
 
 tf = st.sidebar.selectbox("Aikaväli", ["1m", "3m", "5m", "15m", "1h"], index=0)
-limit = st.sidebar.slider("Kynttilöitä", 80, 300, 160)
+limit = st.sidebar.slider("Kynttilöitä", 80, 400, 180)
 
 st.sidebar.divider()
 st.sidebar.subheader("🤖 ChatGPT")
-chatgpt_on = st.sidebar.toggle("ChatGPT-analyysi päällä", value=True)
-api_key_input = st.sidebar.text_input("OpenAI API-avain", type="password")
 
+chatgpt_on = st.sidebar.toggle("ChatGPT-analyysi päällä", value=True)
+
+api_key_input = st.sidebar.text_input(
+    "OpenAI API-avain",
+    type="password",
+    value=st.session_state.api_key,
+    help="Voit myös lisätä avaimen Streamlit Secrets -kohtaan."
+)
+
+if api_key_input:
+    st.session_state.api_key = api_key_input
+
+if st.sidebar.button("Tyhjennä API-avain tästä istunnosta"):
+    st.session_state.api_key = ""
+    st.rerun()
+
+st.sidebar.divider()
+st.sidebar.subheader("💰 Paper Trading")
+
+if st.sidebar.button("Lisää harjoitusrahaa +1000"):
+    st.session_state.paper_balance += 1000
+
+if st.sidebar.button("Nollaa harjoitustili"):
+    st.session_state.paper_balance = 10000.0
+    st.session_state.paper_trades = []
+    st.rerun()
+
+
+# =========================
+# DATA
+# =========================
 
 BINANCE_URLS = [
     "https://data-api.binance.vision/api/v3/klines",
@@ -104,7 +156,7 @@ def make_demo_data(limit_count, base_price=50000):
     return pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
 
 
-@st.cache_data(ttl=4, show_spinner=False)
+@st.cache_data(ttl=5, show_spinner=False)
 def get_data(symbol_code, interval, limit_count):
     last_error = ""
 
@@ -132,7 +184,7 @@ def get_data(symbol_code, interval, limit_count):
 
             data = r.json()
 
-            if not isinstance(data, list) or len(data) < 20:
+            if not isinstance(data, list) or len(data) < 30:
                 last_error = f"{url} palautti huonon datan"
                 continue
 
@@ -149,7 +201,7 @@ def get_data(symbol_code, interval, limit_count):
 
             df = df.dropna()
 
-            if len(df) < 20:
+            if len(df) < 30:
                 last_error = "liian vähän kelvollista dataa"
                 continue
 
@@ -173,6 +225,10 @@ def get_data(symbol_code, interval, limit_count):
     demo = make_demo_data(limit_count, base)
     return demo, f"Demo-varadata käytössä. Binance ei vastannut: {last_error}"
 
+
+# =========================
+# INDIKAATTORIT
+# =========================
 
 def add_indicators(df):
     df = df.copy()
@@ -214,11 +270,21 @@ def add_indicators(df):
     df["VWAP"] = (typical * df["volume"]).cumsum() / volume_sum
     df["VWAP"] = df["VWAP"].ffill().bfill()
 
+    df["SMA20"] = df["close"].rolling(20, min_periods=5).mean()
+    df["STD20"] = df["close"].rolling(20, min_periods=5).std().fillna(0)
+    df["BB_UPPER"] = df["SMA20"] + 2 * df["STD20"]
+    df["BB_LOWER"] = df["SMA20"] - 2 * df["STD20"]
+
     return df
 
 
+# =========================
+# SIGNAALI
+# =========================
+
 def calculate_signal(df):
     last = df.iloc[-1]
+    prev = df.iloc[-2]
 
     score = 0
     reasons = []
@@ -300,9 +366,35 @@ def calculate_signal(df):
         score -= 7
         reasons.append("Hinta on lähellä tukea / breakdown-riski.")
 
+    # Fake breakout / liquidity trap
+    prior = df.iloc[-25:-1]
+    recent_high = prior["high"].max()
+    recent_low = prior["low"].min()
+
+    if last["high"] > recent_high and last["close"] < recent_high:
+        score -= 14
+        reasons.append("Mahdollinen fake breakout ylhäällä / bull trap.")
+
+    if last["low"] < recent_low and last["close"] > recent_low:
+        score += 14
+        reasons.append("Mahdollinen liquidity sweep alhaalla / ostajat puolustivat.")
+
+    # Range filter
+    range_pct = (recent["high"].max() - recent["low"].min()) / max(price, 0.0000001)
+    ema_spread = abs(last["EMA50"] - last["EMA100"]) / max(price, 0.0000001)
+
+    no_trade = False
+    if range_pct < 0.0045 and ema_spread < 0.0022:
+        score *= 0.65
+        no_trade = True
+        reasons.append("Markkina on sivuttaisessa rangessa: varovaisuus.")
+
     score = int(max(-100, min(100, score)))
 
-    if score >= 55:
+    if no_trade and abs(score) < 40:
+        signal = "EI TREIDIÄ"
+        color = "#94a3b8"
+    elif score >= 55:
         signal = "VAHVA OSTA"
         color = "#22c55e"
     elif score >= 28:
@@ -346,6 +438,10 @@ def calculate_signal(df):
     }
 
 
+# =========================
+# CHATGPT
+# =========================
+
 def chatgpt_analysis(df, ai):
     if not chatgpt_on:
         return "ChatGPT-analyysi ei ole päällä."
@@ -353,7 +449,7 @@ def chatgpt_analysis(df, ai):
     if OpenAI is None:
         return "OpenAI-kirjasto ei ole käytössä. Tarkista requirements.txt."
 
-    api_key = api_key_input or st.secrets.get("OPENAI_API_KEY", "")
+    api_key = st.session_state.api_key or st.secrets.get("OPENAI_API_KEY", "")
 
     if not api_key:
         return "Lisää OpenAI API-avain sivupalkkiin tai Streamlit Secrets -kohtaan."
@@ -403,6 +499,10 @@ Selitä lyhyesti:
         return f"ChatGPT virhe: {e}"
 
 
+# =========================
+# UI
+# =========================
+
 st.title("📈 TreidiMestari AI Cloud")
 st.caption(f"Suomen aika: {now_fi().strftime('%H:%M:%S')}")
 
@@ -440,6 +540,11 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+
+# =========================
+# KAAVIO
+# =========================
+
 fig = go.Figure()
 
 fig.add_trace(go.Candlestick(
@@ -456,6 +561,8 @@ fig.add_trace(go.Scatter(x=df["time"], y=df["EMA21"], name="EMA21", mode="lines"
 fig.add_trace(go.Scatter(x=df["time"], y=df["EMA50"], name="EMA50", mode="lines"))
 fig.add_trace(go.Scatter(x=df["time"], y=df["EMA100"], name="EMA100", mode="lines"))
 fig.add_trace(go.Scatter(x=df["time"], y=df["VWAP"], name="VWAP", mode="lines"))
+fig.add_trace(go.Scatter(x=df["time"], y=df["BB_UPPER"], name="Bollinger ylä", mode="lines"))
+fig.add_trace(go.Scatter(x=df["time"], y=df["BB_LOWER"], name="Bollinger ala", mode="lines"))
 
 fig.add_hline(y=ai["support"], line_dash="dot")
 fig.add_hline(y=ai["resistance"], line_dash="dot")
@@ -473,6 +580,11 @@ fig.update_layout(
 )
 
 st.plotly_chart(fig, use_container_width=True)
+
+
+# =========================
+# RSI / MACD
+# =========================
 
 left, right = st.columns(2)
 
@@ -494,6 +606,11 @@ with right:
     macd_fig.update_layout(template="plotly_dark", height=300)
     st.plotly_chart(macd_fig, use_container_width=True)
 
+
+# =========================
+# ENTRY
+# =========================
+
 st.subheader("🎯 Entry / Stop / Target")
 
 if ai["stop"] is not None:
@@ -504,10 +621,69 @@ if ai["stop"] is not None:
 else:
     st.info("Ei vielä selkeää entryä. Odota vahvempaa signaalia.")
 
+
+# =========================
+# PAPER TRADING
+# =========================
+
+st.subheader("💰 Paper Trading")
+
+p1, p2, p3 = st.columns(3)
+p1.metric("Harjoitussaldo", f"{st.session_state.paper_balance:,.2f} USDT")
+p2.metric("Treidejä", len(st.session_state.paper_trades))
+p3.metric("Viimeisin hinta", f"{ai['price']:,.4f}")
+
+trade_amount = st.number_input("Treidin koko USDT", min_value=10.0, max_value=10000.0, value=100.0, step=10.0)
+
+buy_col, sell_col = st.columns(2)
+
+with buy_col:
+    if st.button("Paper OSTA"):
+        if trade_amount <= st.session_state.paper_balance:
+            st.session_state.paper_balance -= trade_amount
+            st.session_state.paper_trades.append({
+                "time": now_fi().strftime("%H:%M:%S"),
+                "type": "OSTA",
+                "symbol": selected_name,
+                "price": ai["price"],
+                "amount": trade_amount
+            })
+            st.success("Paper osto tallennettu.")
+        else:
+            st.error("Ei tarpeeksi harjoitussaldoa.")
+
+with sell_col:
+    if st.button("Paper MYY"):
+        st.session_state.paper_balance += trade_amount
+        st.session_state.paper_trades.append({
+            "time": now_fi().strftime("%H:%M:%S"),
+            "type": "MYY",
+            "symbol": selected_name,
+            "price": ai["price"],
+            "amount": trade_amount
+        })
+        st.success("Paper myynti tallennettu.")
+
+with st.expander("Paper trading -historia"):
+    if st.session_state.paper_trades:
+        st.dataframe(pd.DataFrame(st.session_state.paper_trades), use_container_width=True)
+    else:
+        st.info("Ei vielä harjoitustreidejä.")
+
+
+# =========================
+# SYYT
+# =========================
+
 st.subheader("🧠 Miksi signaali on tämä?")
 
 for reason in ai["reasons"]:
     st.write("• " + reason)
+
+
+# =========================
+# CHATGPT
+# =========================
 
 st.subheader("🤖 ChatGPT-treidiopettaja")
 
@@ -534,5 +710,6 @@ with st.expander("🧠 AI-muisti"):
             st.write(item["analysis"])
     else:
         st.info("Ei vielä tallennettuja AI-analyysejä.")
+
 
 st.warning("Opetustyökalu. Tämä ei ole sijoitusneuvo eikä tee oikeita kauppoja.")
